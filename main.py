@@ -25,6 +25,7 @@ import argparse
 import logging
 import os
 import sys
+import time
 from pathlib import Path
 
 GPU_ADMIN_TOOLS_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), 'gpu-admin-tools'))
@@ -35,8 +36,8 @@ from kubernetes.client.rest import ApiException
 
 # Import gpu-admin-tools
 try:
-    from nvidia_gpu_tools import Gpu
-    from pci.devices import find_gpus
+    from nvidia_gpu_tools import Gpu, NvSwitch
+    from pci.devices import find_gpus, find_devices_from_string
     from gpu import GpuError
 except ImportError as e:
     print(f"Error importing gpu-admin-tools: {e}", file=sys.stderr)
@@ -119,34 +120,93 @@ class CCManager:
     def get_cc_capable_gpus(self) -> list:
         """
         Discover CC-capable GPUs on the node.
-        
+
         Returns:
             List of Gpu objects for CC-capable GPUs
         """
         cc_gpus = []
-        gpus, _ = find_gpus()
-        for gpu in gpus:
-            # Verify CC is supported
-            if not gpu.is_cc_query_supported:
-                logger.warning(f"GPU {gpu.bdf} does not support CC mode query")
+        all_devices, _ = find_gpus()
+        for device in all_devices:
+            # Skip NVSwitches - they don't support CC mode
+            if device.is_nvswitch():
                 continue
-            
-            cc_gpus.append(gpu)
-            logger.info(f"Found CC-capable GPU: {gpu.bdf} - {gpu.name}")
-                
+
+            # Verify CC is supported
+            if not device.is_cc_query_supported:
+                logger.warning(f"GPU {device.bdf} does not support CC mode query")
+                continue
+
+            cc_gpus.append(device)
+            logger.info(f"Found CC-capable GPU: {device.bdf} - {device.name}")
+
         return cc_gpus
-    
-    def set_cc_mode(self, mode: str) -> bool:
+
+    def validate_mode(self, mode: str) -> bool:
         """
-        Set CC mode on all GPUs.
-        
+        Validate that the mode is supported.
+
+        Args:
+            mode: Mode string to validate
+
+        Returns:
+            True if mode is valid, False otherwise
+        """
+        valid_modes = ['on', 'off', 'devtools', 'ppcie']
+        if mode not in valid_modes:
+            logger.error(f"Invalid mode '{mode}'. Valid modes: {valid_modes}")
+            return False
+        return True
+
+    def get_ppcie_capable_devices(self) -> tuple:
+        """
+        Discover PPCIe-capable devices (GPUs and NVSwitches) on the node.
+
+        Returns:
+            Tuple of (ppcie_gpus, ppcie_switches) lists
+        """
+        ppcie_gpus = []
+        ppcie_switches = []
+
+        # Find GPUs - filter out NVSwitches
+        all_devices, _ = find_gpus()
+        for device in all_devices:
+            # Skip NVSwitches here, they're discovered separately below
+            if device.is_nvswitch():
+                continue
+
+            if device.is_ppcie_query_supported:
+                ppcie_gpus.append(device)
+                logger.info(f"Found PPCIe-capable GPU: {device.bdf} - {device.name}")
+            else:
+                logger.debug(f"GPU {device.bdf} does not support PPCIe")
+
+        # Find NVSwitches
+        try:
+            switches = find_devices_from_string("nvswitches")
+            for switch in switches:
+                if switch.is_ppcie_query_supported:
+                    ppcie_switches.append(switch)
+                    logger.info(f"Found PPCIe-capable NVSwitch: {switch.bdf} - {switch.name}")
+                else:
+                    logger.debug(f"NVSwitch {switch.bdf} does not support PPCIe")
+        except Exception as e:
+            logger.info(f"No NVSwitches found or error discovering them: {e}")
+
+        return (ppcie_gpus, ppcie_switches)
+
+    def _set_cc_mode_internal(self, mode: str) -> bool:
+        """
+        Internal method to set CC mode on all GPUs.
+
         Args:
             mode: Desired CC mode (e.g., 'on', 'off', 'devtools')
-            
+
         Returns:
             True if successful, False otherwise
         """
-        gpus, _ = find_gpus()
+        # Get all devices and filter to only GPUs (exclude NVSwitches)
+        all_devices, _ = find_gpus()
+        gpus = [d for d in all_devices if not d.is_nvswitch()]
         cc_gpus = self.get_cc_capable_gpus()
 
         # If the mode is not off and some of the devices are not cc-capable,
@@ -159,7 +219,7 @@ class CCManager:
         if not gpus:
             logger.warning("No GPUs to configure")
             return True
-        
+
         if not mode:
             logger.info("No CC mode specified, skipping")
             return True
@@ -286,6 +346,242 @@ class CCManager:
 
         return result
 
+    def ppcie_mode_is_set(self, devices: list, mode: str) -> bool:
+        """
+        Check if PPCIe mode is already set on all devices.
+
+        Args:
+            devices: List of Gpu/NvSwitch objects
+            mode: Desired PPCIe mode ("on" or "off")
+
+        Returns:
+            True if already set, False otherwise
+        """
+        for device in devices:
+            try:
+                if device.query_ppcie_mode() != mode:
+                    return False
+            except Exception as e:
+                logger.error(f"Error querying PPCIe mode on {device.bdf}: {e}")
+                return False
+        return True
+
+    def _set_ppcie_mode_direct(self, devices: list, target_mode: str, label_mode: str) -> bool:
+        """
+        Set PPCIe mode on all devices (GPUs and NVSwitches).
+
+        Args:
+            devices: List of Gpu/NvSwitch objects
+            target_mode: Desired PPCIe mode ("on" or "off")
+            label_mode: Mode to set in label ("ppcie" or "off")
+
+        Returns:
+            True if successful, False otherwise
+        """
+        logger.info(f"Setting PPCIe mode to '{target_mode}' on {len(devices)} device(s)")
+
+        for device in devices:
+            try:
+                device_type = "NVSwitch" if device.is_nvswitch() else "GPU"
+                current_mode = device.query_ppcie_mode()
+
+                if current_mode == target_mode:
+                    logger.info(f"{device_type} {device.bdf} already in PPCIe '{target_mode}'")
+                    continue
+
+                logger.info(f"Setting PPCIe on {device_type} {device.bdf}: '{current_mode}' → '{target_mode}'")
+                device.set_ppcie_mode(target_mode)
+
+                logger.info(f"Resetting {device_type} {device.bdf}")
+                device.reset_with_os()
+                device.wait_for_boot()
+
+                # Verify
+                new_mode = device.query_ppcie_mode()
+                if new_mode != target_mode:
+                    raise RuntimeError(f"Verification failed: expected '{target_mode}', got '{new_mode}'")
+
+                logger.info(f"Successfully set PPCIe '{target_mode}' on {device_type} {device.bdf}")
+
+            except GpuError as e:
+                logger.error(f"Device error on {device.bdf}: {e}")
+                set_cc_mode_state_label(self.v1, self.node_name, 'failed')
+                return False
+            except Exception as e:
+                logger.error(f"Unexpected error on {device.bdf}: {e}")
+                set_cc_mode_state_label(self.v1, self.node_name, 'failed')
+                return False
+
+        set_cc_mode_state_label(self.v1, self.node_name, label_mode)
+        return True
+
+    def _set_ppcie_mode_with_eviction(self, devices: list, target_mode: str, label_mode: str) -> bool:
+        """
+        Evict GPU components, set PPCIe mode, reschedule components.
+
+        Args:
+            devices: List of Gpu/NvSwitch objects
+            target_mode: Desired PPCIe mode ("on" or "off")
+            label_mode: Mode to set in label ("ppcie" or "off")
+
+        Returns:
+            True if successful, False otherwise
+        """
+        component_labels = fetch_current_component_labels(self.v1, self.node_name)
+        logger.info("Evicting GPU operator components for PPCIe mode change")
+
+        if not evict_gpu_operator_components(
+            self.v1,
+            self.node_name,
+            self.operator_namespace,
+            component_labels,
+            timeout=300
+        ):
+            logger.error("Failed to evict GPU operator components")
+            return False
+
+        result = self._set_ppcie_mode_direct(devices, target_mode, label_mode)
+
+        logger.info("Rescheduling GPU operator components")
+        if not reschedule_gpu_operator_components(
+            self.v1,
+            self.node_name,
+            component_labels
+        ):
+            logger.error("Failed to reschedule GPU operator components")
+            return False
+
+        return result
+
+    def set_ppcie_mode(self, mode: str) -> bool:
+        """
+        Orchestrate PPCIe mode setting on GPUs and NVSwitches.
+
+        Args:
+            mode: Desired mode ("ppcie" or "off")
+
+        Returns:
+            True if successful, False otherwise
+        """
+        ppcie_gpus, ppcie_switches = self.get_ppcie_capable_devices()
+        all_devices = ppcie_gpus + ppcie_switches
+
+        if not all_devices:
+            logger.warning("No PPCIe-capable devices found")
+            set_cc_mode_state_label(self.v1, self.node_name, mode)
+            return True
+
+        target_mode = "on" if mode == "ppcie" else "off"
+
+        if self.ppcie_mode_is_set(all_devices, target_mode):
+            logger.info(f"All devices already in PPCIe '{target_mode}'")
+            set_cc_mode_state_label(self.v1, self.node_name, mode)
+            return True
+
+        if self.evict_operator_components:
+            return self._set_ppcie_mode_with_eviction(all_devices, target_mode, mode)
+        else:
+            return self._set_ppcie_mode_direct(all_devices, target_mode, mode)
+
+    def set_mode(self, mode: str) -> bool:
+        """
+        Set security mode based on label value.
+        Routes to CC or PPCIe handlers based on mode.
+
+        Args:
+            mode: Desired mode ('on', 'off', 'devtools', 'ppcie')
+
+        Returns:
+            True if successful, False otherwise
+        """
+        if not mode:
+            logger.info("No mode specified")
+            return True
+
+        if not self.validate_mode(mode):
+            return False
+
+        # Route based on mode
+        if mode == 'ppcie':
+            return self._handle_ppcie_mode()
+        elif mode in ['on', 'devtools']:
+            return self._handle_cc_mode(mode)
+        else:  # mode == 'off'
+            return self._handle_off_mode()
+
+    def _handle_ppcie_mode(self) -> bool:
+        """
+        Enable PPCIe mode (disables CC first if needed).
+
+        Returns:
+            True if successful, False otherwise
+        """
+        # First disable CC on GPUs if enabled
+        cc_gpus = self.get_cc_capable_gpus()
+        for gpu in cc_gpus:
+            try:
+                if gpu.query_cc_mode() != "off":
+                    logger.info("Disabling CC mode before enabling PPCIe")
+                    if not self._set_cc_mode_internal("off"):
+                        return False
+                    break
+            except Exception as e:
+                logger.warning(f"Could not query CC mode on {gpu.bdf}: {e}")
+
+        # Enable PPCIe
+        return self.set_ppcie_mode("ppcie")
+
+    def _handle_cc_mode(self, mode: str) -> bool:
+        """
+        Enable CC mode (disables PPCIe first if needed).
+
+        Args:
+            mode: CC mode to set ('on' or 'devtools')
+
+        Returns:
+            True if successful, False otherwise
+        """
+        # First disable PPCIe on all devices if enabled
+        ppcie_gpus, ppcie_switches = self.get_ppcie_capable_devices()
+        all_ppcie = ppcie_gpus + ppcie_switches
+
+        for device in all_ppcie:
+            try:
+                if device.query_ppcie_mode() == "on":
+                    logger.info("Disabling PPCIe mode before enabling CC")
+                    if not self.set_ppcie_mode("off"):
+                        return False
+                    break
+            except Exception as e:
+                logger.warning(f"Could not query PPCIe mode on {device.bdf}: {e}")
+
+        # Enable CC
+        return self._set_cc_mode_internal(mode)
+
+    def _handle_off_mode(self) -> bool:
+        """
+        Disable both CC and PPCIe modes.
+
+        Returns:
+            True if successful, False otherwise
+        """
+        success = True
+
+        # Disable PPCIe first
+        if not self.set_ppcie_mode("off"):
+            logger.error("Failed to disable PPCIe mode")
+            success = False
+
+        # Then disable CC
+        if not self._set_cc_mode_internal("off"):
+            logger.error("Failed to disable CC mode")
+            success = False
+
+        if success:
+            set_cc_mode_state_label(self.v1, self.node_name, "off")
+
+        return success
+
     def get_node_cc_mode_label(self) -> None:
         """
         Get the current CC mode label from the node, updates local data.
@@ -316,7 +612,7 @@ class CCManager:
         
         # Start with the initial value and version
         self.get_node_cc_mode_label()
-        self.set_cc_mode(self.with_default(self.current_label))
+        self.set_mode(self.with_default(self.current_label))
         # Create readiness file to indicate container is ready
         create_readiness_file()
 
@@ -362,7 +658,7 @@ class CCManager:
                                 f"(event: {event_type})"
                             )
                             last_label_value = self.current_label
-                            self.set_cc_mode(self.with_default(self.current_label))
+                            self.set_mode(self.with_default(self.current_label))
                             continue
                         
             except ApiException as e:
@@ -388,7 +684,7 @@ class CCManager:
                             f"Label changed: '{last_label_value}' -> '{self.current_label}' "
                         )
                         last_label_value = self.current_label
-                        self.set_cc_mode(self.with_default(self.current_label))
+                        self.set_mode(self.with_default(self.current_label))
                 logger.info("Reconnecting in 5 seconds...")
                 time.sleep(5)
     
@@ -417,7 +713,8 @@ def main():
     parser.add_argument(
         '--default-cc-mode', '-m',
         default=os.environ.get('DEFAULT_CC_MODE', 'on'),
-        help='CC mode to be set by default when node label nvidia.com/cc.mode is not applied'
+        help='Security mode to be set by default when node label nvidia.com/cc.mode is not applied. '
+             'Valid values: on, off, devtools, ppcie'
     )
     parser.add_argument(
         '--node-name',
